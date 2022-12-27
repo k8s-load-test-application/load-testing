@@ -9,61 +9,83 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 type PushHandler func(image []byte) error
+type PullHandler func(url string) error
 
 type DownloadImages interface {
 	Search(keyword string) ([]Image, error)
-	Bulk(keyword string) (int, error)
+	Bulk(keyword string, limit int) (int, error)
 }
 
 type downloadImagesImpl struct {
-	sizeOfPullThread int
-	sizeOfPushThread int
+	sizeOfThreadPerFlow []int
 
 	// @NOTE: this callback will be used to push data to another channel
 	pushers []PushHandler
+	pullers []PullHandler
 }
 
 func (self *downloadImagesImpl) Search(keyword string) ([]Image, error) {
 	return queryGoogleSearch(buildGoogleSearchQuery(keyword))
 }
 
-func (self *downloadImagesImpl) Bulk(keyword string) (int, error) {
-	var iwg, ewg sync.WaitGroup
+func (self *downloadImagesImpl) Bulk(keyword string, limit int) (int, error) {
+	cnt := 0
+	titles := []string{keyword}
 
-	imageList, err := self.Search(keyword)
-	if err != nil {
-		return 0, err
+	for i := 0; ; i++ {
+		nextTitles, size, err := self.doPullAndPush(
+			titles[i],
+			cnt,
+			limit)
+		if err != nil {
+			return cnt, err
+		}
+		cnt += size
+		titles = append(titles, nextTitles...)
+		if cnt >= limit {
+			break
+		}
 	}
+	return cnt, nil
+}
 
-	cntFetchedImages := int32(0)
+func (self *downloadImagesImpl) doPullAndPush(
+	keyword string,
+	current, limit int,
+) ([]string, int, error) {
+	var wgPull, wgPush sync.WaitGroup
 
 	imageChan := make(chan []byte)
-	for id := 0; id < self.sizeOfPushThread; id++ {
-		ewg.Add(1)
+	urlChan := make(chan string)
 
-		go func(imageChan chan []byte, wg *sync.WaitGroup, counter *int32) {
+	// @TODO: split this one to decentralize system
+	for id := 0; id < self.sizeOfThreadPerFlow[1]; id++ {
+		wgPush.Add(1)
+
+		go func(imageChan chan []byte, wg *sync.WaitGroup) {
+			defer wg.Done()
+
 			for image := range imageChan {
 				for _, pusher := range self.pushers {
 					pusher(image)
 				}
-				atomic.AddInt32(counter, 1)
 			}
-		}(imageChan, &ewg, &cntFetchedImages)
+		}(imageChan, &wgPush)
 	}
 
-	for id := 0; id < self.sizeOfPullThread; id++ {
-		iwg.Add(1)
+	// @TODO: split this one to decentralize system
+	for id := 0; id < self.sizeOfThreadPerFlow[0]; id++ {
+		wgPull.Add(1)
 
 		go func(id int, wg *sync.WaitGroup) {
 			defer wg.Done()
 
 			client := http.DefaultClient
-			for layer := 0; layer*self.sizeOfPullThread+id < len(imageList); layer++ {
-				req, _ := http.NewRequest("GET", imageList[layer*self.sizeOfPullThread+id].Url, nil)
+			for url := range urlChan {
+				req, _ := http.NewRequest("GET", url, nil)
 				resp, err := client.Do(req)
 				if err != nil {
 					continue
@@ -73,6 +95,9 @@ func (self *downloadImagesImpl) Bulk(keyword string) (int, error) {
 				if err != nil {
 					continue
 				}
+				for _, puller := range self.pullers {
+					puller(url)
+				}
 
 				mimetype := http.DetectContentType(bytes)
 				if strings.Contains(mimetype, "image") {
@@ -81,14 +106,33 @@ func (self *downloadImagesImpl) Bulk(keyword string) (int, error) {
 					continue
 				}
 			}
-		}(id, &iwg)
+		}(id, &wgPull)
 	}
 
-	iwg.Wait()
-	close(imageChan)
-	ewg.Wait()
+	titles := make([]string, 0)
+	images, err := queryGoogleSearch(buildGoogleSearchQuery(keyword))
+	cntFetchedImages := 0
+	if err != nil {
+		return nil, 0, err
+	}
 
-	return int(cntFetchedImages), nil
+	for _, image := range images {
+		cntFetchedImages++
+		if cntFetchedImages > limit {
+			break
+		}
+
+		titles = append(titles, image.Title)
+		urlChan <- image.Url
+	}
+
+	close(urlChan)
+	wgPull.Wait()
+
+	close(imageChan)
+	wgPush.Wait()
+
+	return titles, int(cntFetchedImages), nil
 }
 
 func parseGoogleSearchResponse(response string) ([]Image, error) {
@@ -163,17 +207,18 @@ func queryGoogleSearch(searchQuery string) ([]Image, error) {
 }
 
 func buildGoogleSearchQuery(keyword string) string {
-	return fmt.Sprintf("https://www.google.com/search?tbm=isch&q=%s", keyword)
+	return fmt.Sprintf("https://www.google.com/search?tbm=isch&q=%s",
+		strings.Replace(keyword, " ", "+", -1))
 }
 
 func NewDownloadImages(
-	numberOfPullThread,
-	numberOfPushThread int,
-	pushers ...PushHandler,
+	numberOfThreadPerFlow []int,
+	pushers []PushHandler,
+	pullers []PullHandler,
 ) DownloadImages {
 	return &downloadImagesImpl{
-		sizeOfPullThread: numberOfPullThread,
-		sizeOfPushThread: numberOfPushThread,
-		pushers:          pushers,
+		sizeOfThreadPerFlow: numberOfThreadPerFlow,
+		pushers:             pushers,
+		pullers:             pullers,
 	}
 }
